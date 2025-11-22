@@ -3,7 +3,6 @@ import time
 import threading
 import numpy as np
 
-# Importar módulos propios
 import config as cfg
 from detector import VehicleDetector
 import visualizer as vis
@@ -28,11 +27,9 @@ class TrafficLightSystem:
         self.detection_interval = 4
 
         # --- GESTIÓN DE ZONAS EN VIVO ---
-        # Cargamos las zonas del config a memoria para poder editarlas sin reiniciar
         self.live_zones = {}
         for i, ch in enumerate(cfg.CAMERA_CHANNELS):
             mz, az = cfg.get_zones(i)
-            # Guardamos la primera zona o lista vacía si no hay
             self.live_zones[ch] = {
                 'main': mz[0] if len(mz) > 0 else [],
                 'arrow': az[0] if len(az) > 0 else []
@@ -41,11 +38,11 @@ class TrafficLightSystem:
         # --- VARIABLES DE EDICIÓN ---
         self.is_editing = False
         self.edit_channel = None
-        self.edit_zone_type = 'main'  # 'main' o 'arrow'
+        self.edit_zone_type = 'main'
         self.edit_points = []
         self.click_cooldown = 0
 
-        # Lógica del Detector
+        # Detector
         self.detector = VehicleDetector()
 
         # Control de secuencia
@@ -62,37 +59,37 @@ class TrafficLightSystem:
 
         for t in self.threads: t.start()
 
-    # --- CALLBACK DEL MOUSE (EL CEREBRO DE LA INTERACCIÓN) ---
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             current_time = time.time()
-            if current_time - self.click_cooldown < 0.3: return  # Debounce
+            if current_time - self.click_cooldown < 0.3: return
             self.click_cooldown = current_time
 
-            # LOGICA 1: MODO GRID (Seleccionar cámara para editar)
+            # LOGICA 1: MODO GRID (Seleccionar cámara)
             if not self.is_editing:
-                # El grid es 2x2. Asumimos ventana de 960x720 (cada cuadro 480x360)
+                # Si hacen click en el menú lateral (x > 960), ignorar
+                if x > 960: return
+
                 col = 0 if x < 480 else 1
                 row = 0 if y < 360 else 1
-                idx = row * 2 + col  # 0, 1, 2, 3
+                idx = row * 2 + col
 
                 if idx < len(cfg.CAMERA_CHANNELS):
                     target_ch = cfg.CAMERA_CHANNELS[idx]
                     print(f"✏️ Seleccionada Cámara {idx} ({target_ch}) para edición")
-
                     self.edit_channel = target_ch
-                    self.edit_points = []  # Empezar zona nueva vacía
+                    self.edit_points = []
                     self.is_editing = True
-                    self.edit_zone_type = 'main'  # Empezar editando zona recta
+                    self.edit_zone_type = 'main'
 
-            # LOGICA 2: MODO EDICIÓN (Poner puntos)
+                    # LOGICA 2: MODO EDICIÓN
             else:
-                # Solo aceptar clicks dentro de la imagen (ignorar menú derecho)
+                # Si hacen click en el menú lateral (x > 640 aprox para video individual), ignorar
                 if x < 640:
                     self.edit_points.append([x, y])
                     print(f"📍 Punto: {x},{y}")
 
-    # --- CONTROL DE TRÁFICO ---
+    # --- MÉTODOS DE CONTROL (SIN CAMBIOS) ---
     def has_vehicles(self, channel, type='any'):
         if self.system_mode[channel] != 'INTELLIGENT': return True
         cnt = self.detection_counts[channel]
@@ -100,12 +97,12 @@ class TrafficLightSystem:
         return cnt['main'] > 0 or cnt['arrow'] > 0
 
     def should_skip_phase(self, phase):
-        if phase == 0:  # Flechas E-O
+        if phase == 0:
             e, o = cfg.CAMERA_CHANNELS[cfg.ESTE_IDX], cfg.CAMERA_CHANNELS[cfg.OESTE_IDX]
             return not (self.has_vehicles(e, 'arrow') or self.has_vehicles(o, 'arrow'))
-        elif phase == 2:  # Norte
+        elif phase == 2:
             return not self.has_vehicles(cfg.CAMERA_CHANNELS[cfg.NORTE_IDX])
-        elif phase == 3:  # Sur
+        elif phase == 3:
             return not self.has_vehicles(cfg.CAMERA_CHANNELS[cfg.SUR_IDX])
         return False
 
@@ -147,7 +144,7 @@ class TrafficLightSystem:
                             next_ph = (next_ph + 1) % 4
                             skipped += 1
 
-                        if skipped == 4:  # Todo vacío -> Reposo
+                        if skipped == 4:
                             if self.current_phase != 1:
                                 self.current_phase = 1
                                 self.set_lights(1, 'green')
@@ -193,10 +190,8 @@ class TrafficLightSystem:
 
                 self.traffic_states[ch] = t_color
                 self.arrow_states[ch] = a_color
-
             time.sleep(0.2)
 
-    # --- PROCESAMIENTO DE IMAGEN ---
     def process_camera(self, channel, frame):
         self.last_frame_time[channel] = time.time()
         if self.system_mode[channel] != 'INTELLIGENT': return frame
@@ -236,7 +231,6 @@ class TrafficLightSystem:
             now = time.time()
             for ch in cfg.CAMERA_CHANNELS:
                 if self.camera_status[ch] == 'active' and (now - self.last_frame_time[ch] > cfg.CAMERA_TIMEOUT):
-                    print(f"⚠️ Cámara {ch} timeout.")
                     self.camera_status[ch] = 'failed'
                     self.system_mode[ch] = 'STANDARD'
                     self.attempt_reconnect(ch)
@@ -263,7 +257,7 @@ class TrafficLightSystem:
             self.attempt_reconnect(ch)
 
     def run(self):
-        print("=== SISTEMA INICIADO CON EDICIÓN EN TIEMPO REAL ===")
+        print("=== SISTEMA DE TRAFICO AI INICIADO ===")
         self.initialize_cameras()
 
         window_name = 'Sistema Semaforo'
@@ -274,7 +268,7 @@ class TrafficLightSystem:
             self.frame_counter += 1
 
             if self.is_editing and self.edit_channel in self.cameras:
-                # --- MODO EDICIÓN ---
+                # --- MODO EDICIÓN (VIDEO + MENÚ DERECHO) ---
                 ret, raw = self.cameras[self.edit_channel].read()
                 if ret:
                     edit_frame = vis.draw_edit_mode(raw.copy(), self.edit_points,
@@ -285,24 +279,20 @@ class TrafficLightSystem:
                 k = cv2.waitKey(1) & 0xFF
                 if k == 27:  # ESC
                     self.is_editing = False
-                    print("Edición cancelada")
                 elif k == ord('z'):  # Undo
                     if self.edit_points: self.edit_points.pop()
                 elif k == ord('t'):  # Toggle
                     self.edit_zone_type = 'arrow' if self.edit_zone_type == 'main' else 'main'
-                    print(f"Cambiado a zona: {self.edit_zone_type}")
                 elif k == ord('s'):  # Save
-                    print(f"💾 Zona {self.edit_zone_type} Guardada!")
                     new_zone = np.array(self.edit_points) if len(self.edit_points) > 2 else []
                     self.live_zones[self.edit_channel][self.edit_zone_type] = new_zone
                     self.is_editing = False
 
             else:
-                # --- MODO GRID ---
+                # --- MODO DASHBOARD (GRID + MENÚ PRINCIPAL) ---
                 frames_list = []
                 for i, ch in enumerate(cfg.CAMERA_CHANNELS):
                     frame = np.zeros((360, 480, 3), dtype=np.uint8)
-
                     if ch in self.cameras and self.cameras[ch].isOpened():
                         ret, raw = self.cameras[ch].read()
                         if ret:
@@ -316,17 +306,23 @@ class TrafficLightSystem:
                                 'zones': (self.live_zones[ch]['main'], self.live_zones[ch]['arrow'])
                             }
                             frame = vis.add_overlay(frame, ch, cfg.CAMERA_NAMES[i], i, state)
-
                     frames_list.append(cv2.resize(frame, (480, 360)))
 
                 top = np.hstack([frames_list[0], frames_list[1]])
                 bot = np.hstack([frames_list[2], frames_list[3]])
-                final_grid = np.vstack([top, bot])
+                grid = np.vstack([top, bot])
 
-                cv2.putText(final_grid, "CLICK EN CAMARA PARA EDITAR ZONAS | 'Q' SALIR", (20, 700),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                # PREPARAR DATOS PARA EL DASHBOARD
+                dashboard_info = {
+                    'phase_idx': self.current_phase,
+                    'active_cams': sum(1 for s in self.camera_status.values() if s == 'active'),
+                    'intelligent_cams': sum(1 for m in self.system_mode.values() if m == 'INTELLIGENT')
+                }
 
-                cv2.imshow(window_name, final_grid)
+                # COMBINAR GRID + DASHBOARD
+                final_view = vis.draw_dashboard(grid, dashboard_info)
+
+                cv2.imshow(window_name, final_view)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -334,7 +330,6 @@ class TrafficLightSystem:
         self.running = False
         cv2.destroyAllWindows()
         for cap in self.cameras.values(): cap.release()
-        print("Sistema cerrado.")
 
 
 if __name__ == '__main__':
