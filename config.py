@@ -2,7 +2,7 @@ import numpy as np
 
 # --- CONFIGURACIÓN DE CÁMARAS ---
 # Canales: Norte, Sur, Este, Oeste
-CAMERA_CHANNELS = [0, 4, 3, 2]
+CAMERA_CHANNELS = [0, 1, 2, 3]
 CAMERA_NAMES = ["Camara Norte", "Camara Sur", "Camara Este", "Camara Oeste"]
 
 # Índices

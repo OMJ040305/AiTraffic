@@ -2,9 +2,11 @@ import cv2
 import time
 import threading
 import numpy as np
+import math
 
 import config as cfg
 from detector import VehicleDetector
+from tracker import EuclideanDistTracker
 import visualizer as vis
 
 
@@ -21,10 +23,28 @@ class TrafficLightSystem:
         self.system_mode = {ch: 'INTELLIGENT' for ch in cfg.CAMERA_CHANNELS}
         self.last_frame_time = {ch: time.time() for ch in cfg.CAMERA_CHANNELS}
 
+        # --- RASTREO Y DETECCIÓN DE INCIDENTES ---
+        self.trackers = {ch: EuclideanDistTracker() for ch in cfg.CAMERA_CHANNELS}
+
+        # Estructura de datos:
+        # { id: {
+        #    'last_pos': (x,y),
+        #    'accumulated_time': float,
+        #    'last_update_time': float,
+        #    'incident_type': str ('none', 'breakdown', 'collision')  <-- NUEVO CAMPO
+        #   }
+        # }
+        self.vehicle_data = {ch: {} for ch in cfg.CAMERA_CHANNELS}
+
+        # --- CONFIGURACIÓN DE INCIDENTES ---
+        self.STOP_THRESHOLD = 15  # Píxeles para considerar movimiento
+        self.ACCIDENT_TIME = 120.0  # 2 MINUTOS (120 seg) para activar alerta
+        self.COLLISION_DIST = 80  # Píxeles de distancia para considerar choque entre dos autos
+
         # Caché visual y optimización
         self.last_detections = {ch: [] for ch in cfg.CAMERA_CHANNELS}
         self.frame_counter = 0
-        self.detection_interval = 4
+        self.detection_interval = 3
 
         # --- GESTIÓN DE ZONAS EN VIVO ---
         self.live_zones = {}
@@ -59,17 +79,91 @@ class TrafficLightSystem:
 
         for t in self.threads: t.start()
 
+    def update_vehicle_status(self, channel, tracked_objects, current_light_state):
+        """Calcula el tiempo detenido acumulado en luz verde."""
+        current_time = time.time()
+        active_ids = []
+
+        for obj in tracked_objects:
+            x, y, x2, y2, vid = obj
+            cx, cy = (x + x2) // 2, (y + y2) // 2
+            active_ids.append(vid)
+
+            if vid not in self.vehicle_data[channel]:
+                self.vehicle_data[channel][vid] = {
+                    'last_pos': (cx, cy),
+                    'accumulated_time': 0.0,
+                    'last_update_time': current_time,
+                    'incident_type': 'none'
+                }
+            else:
+                data = self.vehicle_data[channel][vid]
+                prev_x, prev_y = data['last_pos']
+                dist = math.hypot(cx - prev_x, cy - prev_y)
+                dt = current_time - data['last_update_time']
+
+                # 1. ¿SE MOVIÓ?
+                if dist > self.STOP_THRESHOLD:
+                    data['accumulated_time'] = 0.0  # Reiniciar si se mueve
+                    data['incident_type'] = 'none'
+                else:
+                    # 2. ESTÁ QUIETO: Analizar Semáforo
+                    if current_light_state == 'green':
+                        data['accumulated_time'] += dt
+                    else:
+                        # En ROJO/AMARILLO pausamos el contador (no suma, no borra)
+                        pass
+
+                data['last_pos'] = (cx, cy)
+                data['last_update_time'] = current_time
+
+        # Limpiar memoria
+        known_ids = list(self.vehicle_data[channel].keys())
+        for vid in known_ids:
+            if vid not in active_ids:
+                del self.vehicle_data[channel][vid]
+
+    def check_collisions(self, channel):
+        """
+        NUEVA LÓGICA:
+        Verifica si los vehículos detenidos (> 2 mins) están cerca uno del otro.
+        Si es así, actualiza su estado a 'collision'.
+        """
+        # 1. Filtrar solo vehículos que ya superaron el tiempo de avería
+        stopped_vehicles = []
+        for vid, data in self.vehicle_data[channel].items():
+            if data['accumulated_time'] > self.ACCIDENT_TIME:
+                # Por defecto es avería, a menos que detectemos choque abajo
+                data['incident_type'] = 'breakdown'
+                stopped_vehicles.append((vid, data['last_pos']))
+            else:
+                data['incident_type'] = 'none'
+
+        # 2. Comparar pares de vehículos detenidos
+        # Si hay 2 o más detenidos, checar distancias
+        n = len(stopped_vehicles)
+        if n >= 2:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    id1, pos1 = stopped_vehicles[i]
+                    id2, pos2 = stopped_vehicles[j]
+
+                    # Calcular distancia entre los dos vehículos detenidos
+                    dist = math.hypot(pos1[0] - pos2[0], pos1[1] - pos2[1])
+
+                    # Si están muy cerca (ej. < 80px), es COLISIÓN
+                    if dist < self.COLLISION_DIST:
+                        self.vehicle_data[channel][id1]['incident_type'] = 'collision'
+                        self.vehicle_data[channel][id2]['incident_type'] = 'collision'
+
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             current_time = time.time()
             if current_time - self.click_cooldown < 0.3: return
             self.click_cooldown = current_time
 
-            # LOGICA 1: MODO GRID (Seleccionar cámara)
             if not self.is_editing:
-                # Si hacen click en el menú lateral (x > 960), ignorar
                 if x > 960: return
-
                 col = 0 if x < 480 else 1
                 row = 0 if y < 360 else 1
                 idx = row * 2 + col
@@ -81,15 +175,11 @@ class TrafficLightSystem:
                     self.edit_points = []
                     self.is_editing = True
                     self.edit_zone_type = 'main'
-
-                    # LOGICA 2: MODO EDICIÓN
             else:
-                # Si hacen click en el menú lateral (x > 640 aprox para video individual), ignorar
                 if x < 640:
                     self.edit_points.append([x, y])
-                    print(f"📍 Punto: {x},{y}")
 
-    # --- MÉTODOS DE CONTROL (SIN CAMBIOS) ---
+    # --- MÉTODOS DE CONTROL ---
     def has_vehicles(self, channel, type='any'):
         if self.system_mode[channel] != 'INTELLIGENT': return True
         cnt = self.detection_counts[channel]
@@ -200,29 +290,73 @@ class TrafficLightSystem:
             h, w = frame.shape[:2]
             small = cv2.resize(frame, (int(w * 0.5), int(h * 0.5)))
 
+            # 1. Detect
             bboxes = self.detector.detect(small)
+            rects = []
             if len(bboxes) > 0:
                 bboxes = (bboxes / 0.5).astype(int)
-            else:
-                bboxes = np.empty((0, 4))
+                rects = bboxes.tolist()
 
-            self.last_detections[channel] = bboxes
+            # 2. Track
+            tracked_objects = self.trackers[channel].update(rects)
+            self.last_detections[channel] = tracked_objects
 
+            # 3. Time Update
+            current_light = self.traffic_states[channel]
+            self.update_vehicle_status(channel, tracked_objects, current_light)
+
+            # 4. Collision Check (NUEVO)
+            self.check_collisions(channel)
+
+            # 5. Zones Count
             current_rect = [self.live_zones[channel]['main']]
             current_arrow = [self.live_zones[channel]['arrow']]
 
             c_main, c_arrow = 0, 0
-            for box in bboxes:
-                xc, yc = self.detector.get_center(box)
-                if self.detector.is_valid_detection(xc, yc, current_rect): c_main += 1
-                if self.detector.is_valid_detection(xc, yc, current_arrow): c_arrow += 1
+            for obj in tracked_objects:
+                x, y, x2, y2, _ = obj
+                cx, cy = (x + x2) // 2, (y + y2) // 2
+                if self.detector.is_valid_detection(cx, cy, current_rect): c_main += 1
+                if self.detector.is_valid_detection(cx, cy, current_arrow): c_arrow += 1
 
             self.detection_counts[channel] = {'main': c_main, 'arrow': c_arrow}
 
-        for box in self.last_detections[channel]:
-            cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (255, 0, 0), 2)
-            xc, yc = self.detector.get_center(box)
-            cv2.circle(frame, (xc, yc), 3, (0, 0, 255), -1)
+        # --- DIBUJAR ---
+        for obj in self.last_detections[channel]:
+            x, y, x2, y2, vid = obj
+
+            v_data = self.vehicle_data[channel].get(vid, {})
+            accumulated_time = v_data.get('accumulated_time', 0)
+            incident_type = v_data.get('incident_type', 'none')
+
+            # --- LÓGICA DE VISUALIZACIÓN ---
+            color = (255, 0, 0)  # Azul (Normal)
+            label = f"ID:{vid}"
+
+            # Si es incidente confirmado (> 2 mins)
+            if incident_type == 'collision':
+                color = (255, 0, 255)  # MORADO (Colisión)
+                label = f"COLISION {int(accumulated_time)}s"
+                # Alerta visual fuerte
+                cv2.rectangle(frame, (x, y), (x2, y2), color, 4)
+                cv2.putText(frame, "POSIBLE COLISION", (x, y - 25), cv2.FONT_HERSHEY_BOLD, 0.6, color, 2)
+
+            elif incident_type == 'breakdown':
+                color = (0, 0, 255)  # ROJO (Avería)
+                label = f"AVERIA {int(accumulated_time)}s"
+                cv2.rectangle(frame, (x, y), (x2, y2), color, 2)
+
+            # Si solo está acumulando tiempo pero no llega a los 2 min
+            elif accumulated_time > 10.0:
+                color = (0, 255, 255)  # Amarillo (Advertencia)
+                label = f"ID:{vid} {int(accumulated_time)}s"
+                cv2.rectangle(frame, (x, y), (x2, y2), color, 1)
+            else:
+                # Normal
+                cv2.rectangle(frame, (x, y), (x2, y2), color, 1)
+
+            cv2.circle(frame, ((x + x2) // 2, (y + y2) // 2), 3, color, -1)
+            cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         return frame
 
@@ -268,7 +402,6 @@ class TrafficLightSystem:
             self.frame_counter += 1
 
             if self.is_editing and self.edit_channel in self.cameras:
-                # --- MODO EDICIÓN (VIDEO + MENÚ DERECHO) ---
                 ret, raw = self.cameras[self.edit_channel].read()
                 if ret:
                     edit_frame = vis.draw_edit_mode(raw.copy(), self.edit_points,
@@ -277,19 +410,17 @@ class TrafficLightSystem:
                     cv2.imshow(window_name, edit_frame)
 
                 k = cv2.waitKey(1) & 0xFF
-                if k == 27:  # ESC
+                if k == 27:
                     self.is_editing = False
-                elif k == ord('z'):  # Undo
+                elif k == ord('z'):
                     if self.edit_points: self.edit_points.pop()
-                elif k == ord('t'):  # Toggle
+                elif k == ord('t'):
                     self.edit_zone_type = 'arrow' if self.edit_zone_type == 'main' else 'main'
-                elif k == ord('s'):  # Save
+                elif k == ord('s'):
                     new_zone = np.array(self.edit_points) if len(self.edit_points) > 2 else []
                     self.live_zones[self.edit_channel][self.edit_zone_type] = new_zone
                     self.is_editing = False
-
             else:
-                # --- MODO DASHBOARD (GRID + MENÚ PRINCIPAL) ---
                 frames_list = []
                 for i, ch in enumerate(cfg.CAMERA_CHANNELS):
                     frame = np.zeros((360, 480, 3), dtype=np.uint8)
@@ -312,16 +443,13 @@ class TrafficLightSystem:
                 bot = np.hstack([frames_list[2], frames_list[3]])
                 grid = np.vstack([top, bot])
 
-                # PREPARAR DATOS PARA EL DASHBOARD
                 dashboard_info = {
                     'phase_idx': self.current_phase,
                     'active_cams': sum(1 for s in self.camera_status.values() if s == 'active'),
                     'intelligent_cams': sum(1 for m in self.system_mode.values() if m == 'INTELLIGENT')
                 }
 
-                # COMBINAR GRID + DASHBOARD
                 final_view = vis.draw_dashboard(grid, dashboard_info)
-
                 cv2.imshow(window_name, final_view)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
