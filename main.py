@@ -4,13 +4,14 @@ import threading
 import numpy as np
 import math
 import datetime
-import os  # <--- IMPORTANTE: Para crear carpetas
+import os
 
 # Importar módulos propios
 import config as cfg
 from detector import VehicleDetector
 from tracker import EuclideanDistTracker
 import visualizer as vis
+from stats import StatsManager  # <--- NUEVO IMPORT PARA ESTADÍSTICAS
 
 
 class TrafficLightSystem:
@@ -29,8 +30,12 @@ class TrafficLightSystem:
         # --- RASTREO Y DETECCIÓN DE INCIDENTES ---
         self.trackers = {ch: EuclideanDistTracker() for ch in cfg.CAMERA_CHANNELS}
 
-        # Estructura de datos
+        # Estructura de datos:
+        # { id: { 'last_pos': (x,y), 'accumulated_time': float, 'last_update_time': float, 'incident_type': str, 'alert_sent': bool } }
         self.vehicle_data = {ch: {} for ch in cfg.CAMERA_CHANNELS}
+
+        # --- GESTOR DE ESTADÍSTICAS ---
+        self.stats_manager = StatsManager()  # <--- INICIALIZACIÓN
 
         # --- CONFIGURACIÓN DE INCIDENTES ---
         self.STOP_THRESHOLD = 15
@@ -75,23 +80,28 @@ class TrafficLightSystem:
 
         for t in self.threads: t.start()
 
-    # --- NUEVO: GESTIÓN DE EVIDENCIAS E INFORMES ---
+    # --- GESTIÓN DE EVIDENCIAS E INFORMES ---
     def handle_incident_log(self, channel, vehicle_id, duration, incident_type, frame_copy, position):
-
-        # 1. Preparar Datos
         timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         timestamp_pretty = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cam_name = f"Cam_{channel}"
 
-        # 2. Preparar la Imagen (Evidencia)
-        # Dibujamos sobre la COPIA del frame para no afectar el video en vivo
+        # Obtener nombre de cámara para el log
+        try:
+            cam_idx = cfg.CAMERA_CHANNELS.index(channel)
+            cam_name = cfg.CAMERA_NAMES[cam_idx]
+        except:
+            cam_name = f"Cam_{channel}"
+
+        # 1. REGISTRAR INCIDENTE EN ESTADÍSTICAS
+        self.stats_manager.log_incident(cam_name)
+
+        # 2. PREPARAR EVIDENCIA VISUAL
         cx, cy = position
-        # Caja Roja Fuerte
+        # Dibujo sobre la imagen
         cv2.circle(frame_copy, (cx, cy), 40, (0, 0, 255), 3)
         cv2.line(frame_copy, (cx - 50, cy), (cx + 50, cy), (0, 0, 255), 2)
         cv2.line(frame_copy, (cx, cy - 50), (cx, cy + 50), (0, 0, 255), 2)
 
-        # Texto Informativo quemado en la imagen
         label_top = f"INCIDENTE: {incident_type.upper()}"
         label_bot = f"ID: {vehicle_id} | {int(duration)}s DETENIDO"
 
@@ -99,29 +109,20 @@ class TrafficLightSystem:
         cv2.putText(frame_copy, label_bot, (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(frame_copy, timestamp_pretty, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
 
-        # 3. Guardar Archivo
+        # 3. GUARDAR ARCHIVO
         folder = "evidencias"
-        os.makedirs(folder, exist_ok=True)  # Crea la carpeta si no existe
+        os.makedirs(folder, exist_ok=True)
 
         filename = f"{folder}/{incident_type}_{cam_name}_ID{vehicle_id}_{timestamp_str}.jpg"
         success = cv2.imwrite(filename, frame_copy)
 
-        # 4. Loguear / Notificar
         if success:
             print(f"\n[ALERTA] 📸 Evidencia guardada: {filename}")
         else:
             print(f"\n[ERROR] No se pudo guardar la evidencia.")
 
-        print(f"  > Tipo: {incident_type}")
-        print(f"  > Duracion: {int(duration)}s")
-        print(f"  > Notificando a central... [OK]\n")
-
     def trigger_alert(self, channel, vehicle_id, duration, incident_type, frame):
-        # Hacemos una copia del frame AHORA MISMO para pasarla al hilo
-        # Si pasamos 'frame' directo, podría modificarse antes de guardarse
         frame_copy = frame.copy()
-
-        # Obtenemos la posición actual para el dibujo
         pos = self.vehicle_data[channel][vehicle_id]['last_pos']
 
         t = threading.Thread(
@@ -146,7 +147,7 @@ class TrafficLightSystem:
                     'accumulated_time': 0.0,
                     'last_update_time': current_time,
                     'incident_type': 'none',
-                    'alert_sent': False  # Bandera para no spamear fotos
+                    'alert_sent': False
                 }
             else:
                 data = self.vehicle_data[channel][vid]
@@ -154,34 +155,34 @@ class TrafficLightSystem:
                 dist = math.hypot(cx - prev_x, cy - prev_y)
                 dt = current_time - data['last_update_time']
 
+                # 1. ¿SE MOVIÓ?
                 if dist > self.STOP_THRESHOLD:
-                    # Se mueve
                     data['accumulated_time'] = 0.0
                     data['incident_type'] = 'none'
-                    data['alert_sent'] = False
+                    data['alert_sent'] = False  # Resetear alerta si se mueve
                 else:
-                    # Quieto
+                    # 2. ESTÁ QUIETO
                     if current_light_state == 'green':
                         data['accumulated_time'] += dt
 
-                        # DETECTAR LIMITE DE TIEMPO
                         if data['accumulated_time'] > self.ACCIDENT_TIME:
-                            # Definir tipo (se refina en check_collisions, pero aquí es avería por defecto)
+                            # Si aún no tiene tipo, es avería por defecto
                             if data['incident_type'] == 'none':
                                 data['incident_type'] = 'breakdown'
 
-                            # DISPARAR ALERTA (Solo una vez)
+                            # Enviar alerta una sola vez
                             if not data['alert_sent']:
                                 self.trigger_alert(channel, vid, data['accumulated_time'],
                                                    data['incident_type'], frame_for_evidence)
                                 data['alert_sent'] = True
-
                     else:
-                        pass  # Pausa en rojo
+                        # Pausa en rojo/amarillo
+                        pass
 
                 data['last_pos'] = (cx, cy)
                 data['last_update_time'] = current_time
 
+        # Limpieza de IDs viejos
         known_ids = list(self.vehicle_data[channel].keys())
         for vid in known_ids:
             if vid not in active_ids:
@@ -190,6 +191,7 @@ class TrafficLightSystem:
     def check_collisions(self, channel):
         stopped_vehicles = []
         for vid, data in self.vehicle_data[channel].items():
+            # Solo consideramos vehículos que ya superaron el tiempo de alerta
             if data['accumulated_time'] > self.ACCIDENT_TIME:
                 stopped_vehicles.append((vid, data['last_pos']))
 
@@ -205,8 +207,6 @@ class TrafficLightSystem:
                         # Actualizar ambos a COLISION
                         self.vehicle_data[channel][id1]['incident_type'] = 'collision'
                         self.vehicle_data[channel][id2]['incident_type'] = 'collision'
-                        # Resetear alerta para que se envíe la FOTO DE COLISIÓN si antes se envió de avería
-                        # (Opcional: depende si quieres 2 fotos o solo 1)
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -231,7 +231,7 @@ class TrafficLightSystem:
                 if x < 640:
                     self.edit_points.append([x, y])
 
-    # --- MÉTODOS DE CONTROL ---
+    # --- MÉTODOS DE CONTROL DE TRÁFICO ---
     def has_vehicles(self, channel, type='any'):
         if self.system_mode[channel] != 'INTELLIGENT': return True
         cnt = self.detection_counts[channel]
@@ -345,11 +345,22 @@ class TrafficLightSystem:
             tracked_objects = self.trackers[channel].update(rects)
             self.last_detections[channel] = tracked_objects
 
+            # --- ACTUALIZACIÓN DE ESTADÍSTICAS DE FLUJO ---
+            # El ID más alto del tracker nos dice cuántos coches han pasado
+            max_id = self.trackers[channel].id_count
+            try:
+                cam_idx = cfg.CAMERA_CHANNELS.index(channel)
+                cam_name = cfg.CAMERA_NAMES[cam_idx]
+                self.stats_manager.update_flow(cam_name, max_id)
+            except:
+                pass
+
             current_light = self.traffic_states[channel]
-            # Pasamos el frame ORIGINAL para poder tomar la foto
+            # Analizar incidentes (Avería/Colisión)
             self.update_vehicle_status(channel, tracked_objects, current_light, frame)
             self.check_collisions(channel)
 
+            # Conteo para semáforo
             current_rect = [self.live_zones[channel]['main']]
             current_arrow = [self.live_zones[channel]['arrow']]
 
@@ -436,6 +447,9 @@ class TrafficLightSystem:
         while True:
             self.frame_counter += 1
 
+            # Chequeo periódico de guardado de estadísticas (CSV)
+            self.stats_manager.check_periodic_save()
+
             if self.is_editing and self.edit_channel in self.cameras:
                 ret, raw = self.cameras[self.edit_channel].read()
                 if ret:
@@ -483,12 +497,17 @@ class TrafficLightSystem:
                     'intelligent_cams': sum(1 for m in self.system_mode.values() if m == 'INTELLIGENT')
                 }
 
-                final_view = vis.draw_dashboard(grid, dashboard_info)
+                # OBTENER DATOS DE ESTADÍSTICAS PARA EL DASHBOARD
+                stats_data = self.stats_manager.get_dashboard_data()
+
+                final_view = vis.draw_dashboard(grid, dashboard_info, stats_data)
                 cv2.imshow(window_name, final_view)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
+        # Guardar estadísticas finales antes de salir
+        self.stats_manager.save_snapshot()
         self.running = False
         cv2.destroyAllWindows()
         for cap in self.cameras.values(): cap.release()

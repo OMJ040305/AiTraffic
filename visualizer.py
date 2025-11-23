@@ -114,66 +114,78 @@ def draw_edit_mode(frame, points, camera_name, zone_type):
     return canvas
 
 
-def draw_dashboard(grid_frame, info_data):
+def draw_dashboard(grid_frame, info_data, stats_data=None):
     """
     Dibuja el menú lateral principal (Dashboard) junto al grid de cámaras.
-    info_data: diccionario con {phase_idx, active_cams, intelligent_cams}
+    info_data: {phase_idx, active_cams, intelligent_cams}
+    stats_data: (vehicle_counts, total_cars, total_incidents)
     """
     h, w = grid_frame.shape[:2]
-    MENU_W = 300  # Ancho del menú lateral
+    MENU_W = 350  # Ancho del menú lateral
 
     # Crear lienzo grande
     canvas = np.zeros((h, w + MENU_W, 3), dtype=np.uint8)
     canvas[:, :w] = grid_frame
-    canvas[:, w:] = (30, 30, 30)  # Gris oscuro (un poco más oscuro que el editor)
+    canvas[:, w:] = (30, 30, 30)
 
     ui_x = w + 20
 
     # --- TÍTULO ---
-    cv2.putText(canvas, "CONTROL DE", (ui_x, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(canvas, "TRAFICO AI", (ui_x, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    cv2.putText(canvas, "CONTROL TRAFICO", (ui_x, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.line(canvas, (ui_x, 55), (w + MENU_W - 20, 55), (100, 100, 100), 1)
 
-    cv2.line(canvas, (ui_x, 110), (w + MENU_W - 20, 110), (100, 100, 100), 1)
+    # --- ESTADÍSTICAS EN VIVO ---
+    if stats_data:
+        v_counts, total_cars, total_incidents = stats_data
 
-    # --- ESTADO DEL SISTEMA ---
-    cv2.putText(canvas, "ESTADO SISTEMA", (ui_x, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(canvas, "ESTADISTICAS (HOY)", (ui_x, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
-    cv2.putText(canvas, f"Camaras Activas: {info_data['active_cams']}/4", (ui_x, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (0, 255, 0), 1)
-    cv2.putText(canvas, f"Modo Inteligente: {info_data['intelligent_cams']}/4", (ui_x, 210), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (0, 255, 0), 1)
+        # Resumen Grande
+        cv2.putText(canvas, f"TOT. AUTOS: {total_cars}", (ui_x, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(canvas, f"INCIDENTES: {total_incidents}", (ui_x, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
+                    2)
 
-    cv2.line(canvas, (ui_x, 240), (w + MENU_W - 20, 240), (100, 100, 100), 1)
+        # Detalle por cámara
+        y_stat = 180
+        for name in sorted(v_counts.keys()):
+            # Nombre corto para que quepa
+            short_name = name.replace("Camara ", "")
+            count = v_counts.get(name, 0)
+            text = f"{short_name}: {count}"
+            cv2.putText(canvas, text, (ui_x, y_stat), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            y_stat += 25
+    else:
+        y_stat = 200
 
-    # --- FASE ACTUAL (SEMÁFORO) ---
-    cv2.putText(canvas, "FASE ACTUAL", (ui_x, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.line(canvas, (ui_x, 280), (w + MENU_W - 20, 280), (100, 100, 100), 1)
 
-    # Lista de fases para resaltar la activa
+    # --- FASE ACTUAL ---
+    cv2.putText(canvas, "FASE SEMAFORO", (ui_x, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
     phases = ["1. Flechas E-O", "2. Rectos E-O", "3. Norte", "4. Sur"]
     current = info_data['phase_idx']
 
-    y_ph = 320
+    y_ph = 340
     for i, ph_name in enumerate(phases):
-        color = (50, 50, 50)  # Color apagado
+        color = (80, 80, 80)
         thickness = 1
         prefix = "  "
-
         if i == current:
-            color = (0, 255, 0)  # Verde brillante
+            color = (0, 255, 0)
             thickness = 2
             prefix = "> "
-
         cv2.putText(canvas, prefix + ph_name, (ui_x, y_ph), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, thickness)
-        y_ph += 35
+        y_ph += 30
 
-    cv2.line(canvas, (ui_x, 480), (w + MENU_W - 20, 480), (100, 100, 100), 1)
+    # --- ESTADO SISTEMA ---
+    y_sys = 480
+    cv2.putText(canvas, "SISTEMA", (ui_x, y_sys), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.putText(canvas, f"Cams Activas: {info_data['active_cams']}/4", (ui_x, y_sys + 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 255, 0), 1)
+    cv2.putText(canvas, f"Modo Intel: {info_data['intelligent_cams']}/4", (ui_x, y_sys + 60), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (0, 255, 0), 1)
 
-    # --- INSTRUCCIONES ---
-    cv2.putText(canvas, "ACCIONES", (ui_x, 520), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    cv2.putText(canvas, "Click en camara:", (ui_x, 550), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-    cv2.putText(canvas, "para EDITAR ZONA", (ui_x, 575), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-    cv2.rectangle(canvas, (ui_x, 650), (ui_x + 100, 690), (0, 0, 200), -1)
-    cv2.putText(canvas, "Q: SALIR", (ui_x + 10, 675), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    # Pie de página
+    cv2.rectangle(canvas, (ui_x, 650), (ui_x + 100, 690), (50, 50, 50), -1)
+    cv2.putText(canvas, "Q: SALIR", (ui_x + 10, 675), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     return canvas
